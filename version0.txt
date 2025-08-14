@@ -1,0 +1,371 @@
+#include <stdlib.h>
+#include "vfs.h"
+#include "format.h"
+#include <cstring>
+#include <cstdio>
+#include <fcntl.h>
+
+vnode_t* fs_root = NULL;
+int fs_errno = 0;
+char* mem_buffer;
+
+//use for vnode number
+int next_vnode;
+struct superblock s_block;
+struct vnode *root_vnode = NULL;
+
+vnode* open_dir;
+int open_file_permissions;
+vnode* open_file;
+
+/*
+
+Make sure that IN and VN have the same name size
+Rewrite printdisk
+
+fix shell
+deal with the case that the f_mount is called to mount file system in current file system
+this involves using path
+next vnode may become an issue
+settle whether or not I have a boot block
+
+f_open - in progress
+f_read
+f_write
+f_close
+f_seek
+f_stat - in progress
+f_remove
+f_opendir
+f_readdir
+f_closedir
+f_mkdir
+f_rmdir
+f_mount
+f_unmount - in progress
+
+*/
+
+int move_dir() {
+  return -1;
+}
+
+int find_file(vnode_t *vn, const char *filename ) {
+  
+  return -1;
+}
+
+int f_create(vnode_t *vn, const char *filename ) {
+  
+  return -1;
+}
+
+//add in a check that the child is a file not a dir
+vfd_t f_open(vnode_t *vn, const char *filename, int flags, char* mem_buffer){
+  struct vnode *child_vn;
+  if (vn->type == 0 && flags & O_CREAT) {
+     //the filename was not amoung the child vnodes, it must be made
+    struct vnode *new_vn = (vnode*)(malloc(sizeof(vnode)));
+    struct inode new_in;
+
+    strcpy(new_in.name, (char*)filename);
+    new_in.type = 1;
+    new_in.permissions = flags;
+    s_block.free_inode++;
+    new_in.size = 0;
+    //change the free next inode of the last assigned block
+    char* mem_ptr = mem_buffer+0;
+    memcpy((void*)&mem_ptr,(void*)& s_block, sizeof(superblock));
+
+    new_vn->inode = s_block.free_inode;
+    memset(&new_vn->child_ptrs, 0, sizeof(new_vn->child_ptrs));
+    new_vn->type = 1;
+    new_vn->permissions = flags;
+    new_vn->num_children = 0;
+    new_vn->parent = vn;
+    new_vn->vnode_number = next_vnode;
+    next_vnode++;
+    //update parent vnode
+    vn->child_ptrs[vn->num_children] = new_vn;
+    vn->num_children = vn->num_children + 1;
+    
+
+    mem_ptr = (new_vn->inode)*BLOCK_SIZE + INODE_OFFSET + mem_buffer;
+    memcpy( (void*)&mem_ptr, (void*)&new_in, sizeof(inode));
+  } else if (vn->type == 1) {
+    for (int i = 0; i < vn->num_children; i++) {
+      child_vn = vn->child_ptrs[i];
+      if (strcmp(child_vn->name, (char*)filename) == 0) {
+        open_file = child_vn;
+      }
+    }
+  }
+  
+  
+
+ 
+  
+  return -1;
+}
+
+size_t f_read(vnode_t *vn, void *data, size_t size, int num, vfd_t fd)
+{
+  return -1;
+}
+
+size_t f_write(vnode_t *vn, void *data, size_t size, vfd_t fd)
+{
+  
+  return -1;
+}
+
+int f_close(vnode_t *vn, vfd_t fd)
+{
+  return -1;
+}
+
+int f_seek(vnode_t *vn, vfd_t fd, off_t offset, int whence)
+{
+  //move mem_buffer ptr
+  vnode current_in;
+  char* mem_ptr = mem_buffer + vn->inode*BLOCK_SIZE + INODE_OFFSET;
+  memcpy((void*)&current_in, (void*)mem_ptr, sizeof(inode));
+
+  return -1;
+}
+
+int f_stat(vnode_t *vn, vfd_t fd, vstat_t* stats)
+{
+  //fill out vstats
+  inode current_in;
+  char* mem_ptr = mem_buffer + vn->inode*BLOCK_SIZE + INODE_OFFSET;
+  memcpy((void*)&current_in, (void*)&mem_ptr, sizeof(inode));
+  stats->st_type = vn->type;
+  stats->st_inode = vn->inode;
+  stats->st_perms = vn->permissions;
+  stats->st_size = current_in.size;
+  if (current_in.size <= N_DBLOCKS*BLOCK_SIZE) {
+    stats->st_blocks = N_DBLOCKS;
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 1*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 1 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 2*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 2 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 3*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 3 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 4*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 4 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else {
+    stats->st_blocks = -1;
+  }
+  
+  return -1;
+}
+
+int f_remove(vnode_t *vn, vfd_t fd)
+{
+  return -1;
+}
+
+vfd_t f_opendir(vnode_t *vn, const char* path)
+{
+  return -1;
+}
+
+//TODO:Decide if I need to malloc and free the vdir entries
+vdir_entry* f_readdir(vnode_t *vn, vfd_t fd)
+{
+  struct vdir_entry *table_entry = (vdir_entry*)malloc(sizeof(vdir_entry));
+  memcpy((void*)table_entry, (void*)&fd, sizeof(vdir_entry));
+  return NULL;
+}
+
+int f_closedir(vnode_t *vn, int fd)
+{
+  return -1;
+}
+ 
+int f_mkdir(vnode_t *vn, const char* path)
+{
+  return -1;
+}
+ 
+int f_rmdir(vnode_t *vn, const char* path)
+{
+  /*find the children of the dir and remove them as well*/
+  return -1;
+}
+
+//recursive logic to build the tree
+int build_vnode_tree(vnode* parent_vn, int child_in_idx) {
+  printf("build tree %d\n", next_vnode);
+  struct vdir_entry table_entry;
+  struct vnode* new_vn;
+  struct inode child_in;
+
+  //get the inode;
+  char* mem_ptr = (mem_buffer + INODE_OFFSET) + (child_in_idx * BLOCK_SIZE);
+  //mem_ptr = mem_ptr + (child_in_idx * BLOCK_SIZE);
+  memcpy((void*)&child_in, &mem_ptr, sizeof(inode));
+
+  // make new vnode 
+  new_vn = (vnode*)(malloc(sizeof(vnode)));
+  new_vn->parent = parent_vn;
+  strcpy(new_vn->name, child_in.name);
+  new_vn->permissions = child_in.permissions;
+  new_vn->vnode_number = next_vnode;
+  next_vnode++;
+  new_vn->inode = child_in_idx;
+  
+  //the inode is a file, return
+  if (child_in.type == 1) {
+    new_vn->type = 1;
+    new_vn->num_children = -1;
+    return 0;
+  }
+
+  //the inode is a dir inode,recurse
+  new_vn->type = 0;
+  new_vn->num_children = (child_in.size)/(sizeof(vdir_entry));
+  int children_read = 0;
+
+  for (int i = 0; i < N_DBLOCKS && children_read < new_vn->num_children;i++) {
+    mem_ptr = (child_in.dblocks[i]*BLOCK_SIZE)+mem_buffer+INODE_OFFSET;
+    memcpy((void*)&table_entry, (void*)&mem_ptr, sizeof(vdir_entry));
+    //update the number of children of a dir
+    new_vn->num_children = new_vn->num_children + 1;
+    children_read++;
+    //recurse
+    build_vnode_tree(new_vn, table_entry.inode_idx);
+  }
+
+  //go through indirect blocks
+  for (int j = 0; j < N_IBLOCKS && children_read < new_vn->num_children; j++) {
+    char* table_mem_ptr = child_in.iblocks[j]*BLOCK_SIZE+mem_buffer+INODE_OFFSET;
+    char* table_mem_end = mem_ptr+BLOCK_SIZE;
+    //go through the table of pointer to other blocks
+    while (table_mem_ptr <table_mem_end && children_read < new_vn->num_children) {
+      char* dir_table_mem_ptr;
+      char* dir_table_mem_end;
+      memcpy((void*)&dir_table_mem_ptr, (void*)&table_mem_ptr, sizeof(int));
+      dir_table_mem_end = dir_table_mem_ptr + BLOCK_SIZE;
+      //go through the directory table
+      while (dir_table_mem_ptr < dir_table_mem_end && children_read < new_vn->num_children) {
+        memcpy((void*)&table_entry, (void*)&dir_table_mem_ptr, sizeof(vdir_entry));
+        //update the number of children of a dir
+        new_vn->num_children = new_vn->num_children + 1;
+        children_read++;
+        //recurse
+        build_vnode_tree(new_vn, table_entry.inode_idx);
+        //update ptr in table
+        dir_table_mem_ptr = dir_table_mem_ptr + sizeof(vdir_entry);
+      }
+      //update ptr in table
+      table_mem_ptr = table_mem_ptr+ sizeof(int);
+    }
+  }
+
+  return 0;
+}
+
+/*initialize the mem_buffer*/
+//TODO: decide if init_fs should call fmount on disk
+int init_fs() {
+  memset(mem_buffer, 0, sizeof(mem_buffer));
+  mem_buffer_ptr = mem_buffer;
+
+  FILE *disk= fopen("file_sys.bin", "r");
+
+  if (disk == NULL) {
+      printf("DISK file not found. File system not loaded.\n Please format file system by issuing \"./format\" command\n");
+  } else {
+    fread(mem_buffer, 1, 1000000 - 1, disk);
+      //f_mount();
+  }
+  
+  fclose(disk);
+  return 1;
+}
+ 
+int f_mount(vnode_t *vn, const char* sourcefile, const char* path) {
+  struct vnode *current_vn = vn;
+  struct inode current_in;
+  struct vdir_entry table_entry;
+
+  //not mounting onto existing file system
+  if (root_vnode == NULL) {
+    mem_ptr = mem_buffer+INODE_OFFSET;
+    memcpy((void*)&current_in, (void*)&ptr, sizeof(inode));
+    //move beyond boot block to superblock
+    mem_ptr = mem_buffer+BLOCK_SIZE;
+    memcpy((void*)&s_block, (void*)mem_buffer, sizeof(superblock));
+
+    //deal with making the root vnode. if the root vnode is null, initialize vnode tree root
+    if (current_in.type == 0) {
+      current_vn = (vnode*)malloc(sizeof(vnode));
+      current_vn->type = 0;
+      current_vn->vnode_number = next_vnode;
+      next_vnode++;
+      strcpy(current_vn->name, current_in.name);
+      current_vn->parent = NULL;
+      current_vn->permissions = (O_RDWR);
+      current_vn->inode = 0;
+      current_vn->num_children = (current_in.size)/(sizeof(vdir_entry));
+      root_vnode = current_vn;
+      printf("root dir name is %s num children %d\n",current_in.name, current_vn->num_children);
+    } else {
+      //there was no root dir, return 0
+      return -1;
+    }
+
+    int children_read = 0;
+    //for each child of the root dir
+    for (int i = 0; i < N_DBLOCKS && children_read < current_vn->num_children; i++ ) {
+      //find the entry of the child in the table
+      mem_ptr = current_in.dblocks[i]*BLOCK_SIZE + DATA_OFFSET + mem_buffer;
+      //copy the inode information to an entry struct
+      memcpy((void*)&table_entry, (void*)&mem_ptr, sizeof(vdir_entry));
+      //build up the vnode tree under that child
+      build_vnode_tree(root_vnode, table_entry.inode_idx);
+      //log another dir table entry as read
+      children_read++;
+      //update the number of children
+    }
+
+    //go through indirect blocks, look for child inodes
+    for (int j = 0; j < N_IBLOCKS && children_read < current_vn->num_children; j++) {
+      char* table_mem_ptr = current_in.iblocks[j]*BLOCK_SIZE+mem_buffer+INODE_OFFSET;
+      char* table_mem_end = mem_ptr+BLOCK_SIZE;
+      //go through the table of pointer to other blocks
+      while (table_mem_ptr <table_mem_end && children_read < current_vn->num_children) {
+        char* dir_table_mem_ptr;
+        char* dir_table_mem_end;
+        memcpy((void*)&dir_table_mem_ptr, (void*)&table_mem_ptr, sizeof(int));
+        dir_table_mem_end = dir_table_mem_ptr + BLOCK_SIZE;
+        //go through the directory table
+        while (dir_table_mem_ptr < dir_table_mem_end && children_read < current_vn->num_children) {
+          memcpy((void*)&table_entry, (void*)&dir_table_mem_ptr, sizeof(vdir_entry));
+          //update the number of children of a dir
+          current_vn->num_children = current_vn->num_children + 1;
+          children_read++;
+          //recurse
+          build_vnode_tree(current_vn, table_entry.inode_idx);
+          //update ptr in table
+          dir_table_mem_ptr = dir_table_mem_ptr + sizeof(vdir_entry);
+        }
+        //update ptr in table
+        table_mem_ptr = table_mem_ptr+ sizeof(int);
+      }
+    }
+  }
+
+  //TODO: Deal with case of mounting onto fs
+  return 0;
+}
+ 
+int f_unmount(vnode_t *vn, const char* path)
+{
+  /*free the vnode tree*/
+  return -1;
+}
+ 
+

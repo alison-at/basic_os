@@ -1,0 +1,991 @@
+#include <stdlib.h>
+#include "vfs.h"
+#include "format.h"
+#include <cstring>
+#include <cstdio>
+#include <fcntl.h>
+#include <errno.h>
+
+vnode_t* fs_root = NULL;
+int fs_errno = 0;
+char mem_buffer [1000000];
+
+
+//use for vnode number
+int next_vnode;
+struct superblock s_block;
+struct vnode *root_vnode = NULL;
+
+vnode* open_dir;
+int open_file_permissions;
+vnode* open_file;
+int open_file_pos;//this says how many bytes of data from the first data byte in the file we are at. This is not a memory address
+char buffer_block[BLOCK_SIZE];
+/*
+
+Make sure that IN and VN have the same name size
+Rewrite printdisk
+
+fix shell
+deal with the case that the f_mount is called to mount file system in current file system
+this involves using path
+next vnode may become an issue
+
+correct memcpy: memcpy(&current_in, mem_ptr, sizeof(struct inode));
+
+f_open - in progress
+f_read - in progress
+f_write - in progress
+f_close - done, but what is fd even?
+f_seek - in progress
+f_stat - in progress
+f_remove - in progress this can be refactored down to free block
+f_opendir - in progress
+f_readdir - in progress
+f_closedir - in progress
+f_mkdir - in progress
+f_rmdir - in progress deal with how to free a vnode number
+f_mount - in progress - add ability to mount file system below the root
+f_unmount - in progress
+
+added 
+build_vnode_tree
+remove_vnode_tree
+init_fs 
+write_to_indirect_blocks
+
+refactor
+
+TODO:
+redo math using data_offset not offset in table
+else {
+      table_idx = table_idx -1;
+    } is slopier than using table_idx++;
+
+
+TODO: undo // on memset actions
+
+
+idea: printf the superblock
+*/
+
+
+//Vnode level
+vnode* f_find(vnode* parent_dir, const char* filename) {
+  printf("parent has %d children\n", parent_dir->num_children);
+  for (int i = 0; i < parent_dir->num_children;i++) {
+    vnode *child = parent_dir->child_ptrs[i];
+    printf("child %p %s\n",child,child->name);
+    if ((strcmp(child->name, filename) == 0) ) {
+      return child;
+    }
+  }
+  return NULL;
+}
+
+//TODO: new inode needs to be assigned a place in the code
+vfd_t f_open(vnode_t *vn, const char *filename, int flags) { 
+  char* mem_ptr;
+  if (vn->type == 0 && flags & O_CREAT) {
+    //the filename was not amoung the child vnodes, it must be made
+    struct vnode *new_vn = (vnode*)(malloc(sizeof(vnode)));
+    struct inode new_in;
+
+    //copy info of the next free inode to the new inode
+    new_vn->inode = s_block.free_inode;
+    printf("new inode %d\n", new_vn->inode);
+    printf("in fopen\n");
+    
+    mem_ptr = mem_buffer + INODE_OFFSET+  new_vn->inode*BLOCK_SIZE;
+    memcpy((void*)&new_in, mem_ptr, sizeof(inode));
+
+    for(int h = 0; h < N_DBLOCKS; h++) {
+      printf("data block %d\n", new_in.dblocks[h]);
+    }//between this and write, something goes wrong, also these are for the root
+
+
+    //copy info to superblock
+    s_block.free_inode = new_in.next_inode;
+    mem_ptr = mem_buffer + BLOCK_SIZE;
+    memcpy(mem_ptr, (void*)&s_block, sizeof(superblock));
+
+    //check if the file is amoung the children of vn. If yes, fserror = EEXIST
+    vnode* child = f_find(vn, (char*)filename);
+    if (child != NULL) {
+      fs_errno = EEXIST;
+      return -1;
+    }
+
+    //add information to the new inode
+    strcpy(new_in.name, (char*)filename);
+    new_in.type = 1;
+    new_in.permissions = flags;
+    new_in.size = 0;
+    
+    //add information to the new vnode
+    memset(&new_vn->child_ptrs, 0, sizeof(new_vn->child_ptrs));
+    strncpy(new_vn->name, filename, sizeof(new_vn->name));
+    new_vn->type = 1;
+    new_vn->permissions = flags;
+    new_vn->num_children = 0;
+    new_vn->parent = vn;
+    new_vn->vnode_number = next_vnode;
+    next_vnode++;
+    //update parent vnode
+    vn->child_ptrs[vn->num_children] = new_vn;
+    vn->num_children = vn->num_children + 1;
+
+    //copy inode into memory
+    mem_ptr = + mem_buffer + (new_vn->inode)*BLOCK_SIZE + INODE_OFFSET ;
+    memcpy(mem_ptr, (void*)&new_in, sizeof(inode));
+    printf("new file %s at %p inode idx %d\n", filename, new_vn, new_vn->inode);
+    open_file_pos = 0;
+
+    //update the parent vnode with information about the new file
+    vdir_entry table_entry;
+    table_entry.type = 1;
+    table_entry.valid = 1;
+    table_entry.inode_idx = new_vn->inode;
+    strncpy(table_entry.name, filename, sizeof(table_entry.name));
+    vdir_entry* new_table_entry = NULL;
+
+    // replace a previous table entry, write to the dir if no table entry is invalid
+    //fseek to the invalid entry,, write the invalid entry
+    int num_read = 0;
+    int idx = 0;
+    //int found = 0;
+    
+    while (num_read < vn->num_children) {
+      new_table_entry = f_readdir(vn, idx);
+      if (new_table_entry != NULL && new_table_entry->valid == 0) {
+        //to make sure that size is the same, indicate that you are erasing/overwriting one vdir
+        //this is where we want to write
+        int data_offset = idx*sizeof(vdir_entry);
+        //set the directory to write to invalid entry
+        f_seek(vn, 0, data_offset, SEEK_SET);
+        
+        size_t size = f_write(vn, (void*)&table_entry, sizeof(vdir_entry),1,0);
+
+        printf("here now, wrote %ld info %s at idx %d\n", size, table_entry.name, idx);
+
+        //this is to retrieve the written entry
+        vdir_entry data2;
+        f_seek(vn, 0, data_offset, SEEK_SET);
+        f_read(vn, (void*)&data2, sizeof(vdir_entry),1, 0);
+        printf("data of table entry %s\n", data2.name);
+        //found = 1;
+        free(new_table_entry);
+        break;
+      }
+      free(new_table_entry);
+      idx++;
+    }
+
+    /*if (found == 0) {
+      f_seek(vn, 0,0, SEEK_END);//go to the end of the current data
+      size_t size = f_write(vn, (void*)&table_entry, sizeof(vdir_entry), 1, 0);
+      printf("wrote %ld data to the inode\n", size);
+
+      //this is to retrieve the written entry
+      vdir_entry data3;
+      f_seek(vn, 0, 0, SEEK_SET);
+      f_read(vn, (void*)&data3, sizeof(vdir_entry),1, 0);
+      printf("data of table entry %s\n", data3.name);
+      found = 1;
+      free(new_table_entry);
+    }*/
+    
+    return 0;
+    
+  }  else if (vn->type == 1 && flags & O_APPEND) { 
+    open_file = vn;
+    //open_file_pos to the end
+  } else if (vn->type == 1 && flags & O_TRUNC) {
+    //check that file permissions are  O_RDWR or O_WRONLY
+    if (vn->permissions & O_WRONLY || vn->permissions & O_RDWR) {
+      vnode* parent = vn->parent;
+      f_remove(vn, 0);//remove the current file
+      f_open(parent, filename, O_CREAT);//create the file empty, set to open file and the position = 0
+    }
+  }
+
+  return 0;
+}
+
+void* read_from_indirect_blocks(int starting_table_idx, int bytes_read, int end_bytes, inode current_in, void* data) {
+  char* mem_ptr;
+  int data_block_idx;
+  int diff;
+  //At this point, I need to start allocating new blocks for tables and data
+  //loop through the tables
+  for (int x = starting_table_idx; x < N_IBLOCKS && bytes_read < end_bytes; x++) {
+
+    //loop through the data blocks in each table
+    for (int y = 0; y < (BLOCK_SIZE/4) &&  bytes_read < end_bytes; y++) {
+      //get the top of the table block
+      mem_ptr = mem_buffer+DATA_OFFSET+ current_in.iblocks[x]*BLOCK_SIZE;
+      //get the address in the table
+      mem_ptr = mem_ptr + y*4;
+
+      //get the data block address in the table
+      memcpy((void*)&data_block_idx, mem_ptr, sizeof(int));
+
+      //go to the data block 
+      mem_ptr = mem_buffer+ DATA_OFFSET+ data_block_idx*BLOCK_SIZE;
+
+      if (BLOCK_SIZE > (end_bytes-bytes_read) ) {
+        diff = end_bytes-bytes_read;
+      } else {
+        diff = BLOCK_SIZE;
+      }
+
+      //read to data from memory of indirect data block
+      memcpy(data, mem_ptr, diff);
+      bytes_read = bytes_read + diff;
+    }
+  }
+  return data;
+}
+
+
+size_t f_read(vnode_t *vn, void *data, size_t size, int num, vfd_t fd)
+{
+  int bytes_read = 0;
+  int end_bytes = open_file_pos + size*num;
+
+
+  
+
+  //get the inode of the vn
+  char* mem_ptr = mem_buffer + INODE_OFFSET+ vn->inode*BLOCK_SIZE;
+  struct inode current_in;
+  memcpy((void*)&current_in, mem_ptr, sizeof(inode));
+
+  int starting_block_idx = open_file_pos/BLOCK_SIZE;
+  //int starting_block = current_in.dblocks[starting_block_idx];
+
+  //starting in the direct blocks
+  if (starting_block_idx < N_DBLOCKS) {
+    //read any uneven offset
+    int starting_offset = open_file_pos%BLOCK_SIZE;
+    
+    mem_ptr = mem_buffer + DATA_OFFSET+ starting_block_idx*BLOCK_SIZE + starting_offset;
+    //this is the uneven offset to be read
+    int diff  = BLOCK_SIZE - starting_offset;
+    if (diff > (end_bytes - bytes_read)) {
+      diff = end_bytes - bytes_read;
+    }
+
+    //read from memory to data
+    memcpy(data, mem_ptr, diff);
+    bytes_read = bytes_read + diff;
+    printf("read offset at block %d\n", starting_block);
+
+    if (bytes_read < end_bytes) {
+      //read the rest of the direct blocks
+      for (int i = (starting_block +1); i < N_DBLOCKS && bytes_read < end_bytes; i++) {
+        mem_ptr = mem_buffer + DATA_OFFSET+ current_in.dblocks[i]*BLOCK_SIZE;
+        int diff  = BLOCK_SIZE;
+        if (diff > (end_bytes - bytes_read)) {
+          diff = end_bytes - bytes_read;
+        }
+        printf("am reading at %p, data block %d\n", mem_ptr,current_in.dblocks[i]);
+        memcpy(data, mem_ptr, diff);
+        printf("data so far: %s\n", (char*)data);
+        bytes_read = bytes_read + diff;
+      }
+    }
+    
+    //move to the indirect blocks. We need to alloc each indirect table and data block as we go
+    if (bytes_read < end_bytes) {
+      read_from_indirect_blocks(0, bytes_read, end_bytes, current_in, data);
+    }
+  // we read starting in the indirect blocks. At least one indirect block has been alloced.
+  } else {
+    //                          indirect bytes                        /  bytes stored per indirect table    
+    int indirect_table_idx = (open_file_pos - N_DBLOCKS*BLOCK_SIZE) / ((BLOCK_SIZE/4)*BLOCK_SIZE);
+    //                      indirect bytes                      % bytes stored per indirect table 
+    int offset_in_table = (open_file_pos - N_DBLOCKS*BLOCK_SIZE) % ((BLOCK_SIZE/4)*BLOCK_SIZE);
+    //all bytes alloced over indirect table / bytes alloced per block
+    int table_idx = (offset_in_table)/ BLOCK_SIZE;
+    int offset_in_data = offset_in_table%BLOCK_SIZE;
+    int indirect_table_block = current_in.iblocks[indirect_table_idx];
+    int data_block_idx;
+
+    //if there is a partially filled data block
+    if (offset_in_data != 0) {
+      int diff = BLOCK_SIZE - offset_in_data;
+      //in case we dont need to move to a new block and can read only current block
+      if (diff > (end_bytes - bytes_read)) {
+        diff = end_bytes - bytes_read;
+      }
+
+      //get the top of the table block
+      char* mem_ptr = mem_buffer+DATA_OFFSET+ indirect_table_block*BLOCK_SIZE;
+      //get the address in the table
+      mem_ptr = mem_ptr + table_idx*4;
+
+      //get the data block address in the table
+      memcpy((void*)&data_block_idx, mem_ptr, sizeof(int));
+      //go to the current offset in the data block 
+      mem_ptr = mem_buffer+ DATA_OFFSET+ data_block_idx*BLOCK_SIZE + offset_in_data;
+
+      //read to data from memory of paritally alloced indirect data block
+      memcpy(data, mem_ptr, diff);
+      bytes_read = bytes_read + diff;
+    } else {
+      table_idx = table_idx -1;
+    }
+
+    //if we need to read more indirect blocks in the same table
+    for (int j = table_idx+1; j < (BLOCK_SIZE/4) && bytes_read < end_bytes; j++) {
+      //get the address of the data block in the indirect table
+      
+      mem_ptr = mem_buffer+ DATA_OFFSET+ current_in.iblocks[indirect_table_idx]*BLOCK_SIZE;
+      mem_ptr = mem_ptr+ 4*j;
+
+      //go to the data block
+      memcpy((void*)&data_block_idx, mem_ptr, sizeof(int));
+      mem_ptr = mem_buffer+ DATA_OFFSET+ data_block_idx*BLOCK_SIZE;
+
+      //read to the data block
+      if (end_bytes - bytes_read < BLOCK_SIZE) {
+        memcpy(data, mem_ptr,(end_bytes - bytes_read));
+        bytes_read = bytes_read + (end_bytes - bytes_read);
+      } else {
+        memcpy(data, mem_ptr,BLOCK_SIZE);
+        bytes_read = bytes_read + BLOCK_SIZE;
+      }
+    }
+
+    //if we need to read from whole new tables
+    if (bytes_read < end_bytes) {
+      read_from_indirect_blocks(indirect_table_idx+1, bytes_read, end_bytes , current_in, data);
+    }
+  }
+  return bytes_read;
+}
+
+void* write_to_indirect_blocks(int starting_table_idx, int bytes_written, int end_bytes, inode current_in, void* data) {
+  char* mem_ptr;
+  int diff;
+  //At this point, I need to start allocating new blocks for tables and data
+  for (int x = starting_table_idx; x < N_IBLOCKS && bytes_written < end_bytes; x++) {
+    printf("still writing\n");
+    //get the next free block
+    int alloc_block = s_block.free_block;
+
+    //TODO: change this code update super block with the next free block
+    mem_ptr = mem_buffer + DATA_OFFSET+alloc_block*BLOCK_SIZE;
+    memcpy((void*)&s_block.free_block, mem_ptr, sizeof(int));
+    
+    //write to the indirect block of the current inode
+    current_in.iblocks[x] = alloc_block;
+    //char* ptr_table_block = mem_buffer + DATA_OFFSET + alloc_block * BLOCK_SIZE;
+
+    //alloc a new block as a data block
+    for (int y = 0; y < (BLOCK_SIZE/4) &&  bytes_written < end_bytes; y++) {
+      //update the just alloced indirect table with the alloced data block
+      int alloc_block = s_block.free_block;
+      mem_ptr = mem_buffer+ DATA_OFFSET+ current_in.iblocks[x]*BLOCK_SIZE;
+      mem_ptr = mem_ptr+ 4*y;
+      memcpy(mem_ptr, (void*)&alloc_block, sizeof(int));
+
+      //update super block with the next free block, which is stored in the just alloced block
+      mem_ptr = mem_buffer + DATA_OFFSET+alloc_block*BLOCK_SIZE;
+      memcpy((void*)&s_block.free_block, mem_ptr, sizeof(int));
+
+      diff = BLOCK_SIZE;
+      if (diff > (end_bytes - bytes_written)) {
+        diff = end_bytes - bytes_written;
+      }
+      mem_ptr = mem_buffer + DATA_OFFSET+ alloc_block*BLOCK_SIZE;
+      memcpy(mem_ptr, data, diff);
+      bytes_written = bytes_written + diff;
+      
+      
+    }
+  }
+  return data;
+}
+
+
+//TODO: make sure the offset of the open file gets updated
+//TODO: deal with the fact that we always write from data, the pointer data needs to be updated
+size_t f_write(vnode_t *vn, void *data, size_t size,int num, vfd_t fd)
+{
+  
+  int bytes_written = 0;
+  int end_bytes = open_file_pos + size*num;
+  if (end_bytes > N_DBLOCKS*BLOCK_SIZE + N_IBLOCKS*(BLOCK_SIZE/4)*BLOCK_SIZE) {
+    //the data to write is too big
+  }
+  int starting_block = open_file_pos/BLOCK_SIZE;
+
+  //get the inode of the vn
+  char* mem_ptr = mem_buffer + INODE_OFFSET+ vn->inode*BLOCK_SIZE;
+  struct inode current_in;
+  memcpy((void*)&current_in, mem_ptr, sizeof(inode));
+  printf("writing blocks to %s at %d inode %d first block %d\n", current_in.name, open_file_pos, vn->inode, current_in.dblocks[0]);
+  
+  //starting in the direct blocks
+  if (starting_block < N_DBLOCKS) {
+    
+    //write to fill any uneven offset
+    int starting_offset = open_file_pos%BLOCK_SIZE;
+    mem_ptr = mem_buffer + DATA_OFFSET+ starting_block*BLOCK_SIZE + starting_offset;
+
+    int diff  = BLOCK_SIZE - starting_offset;
+    if (diff > (end_bytes - bytes_written)) {
+      diff = end_bytes - bytes_written;
+    }
+
+    //write from data to memory
+    memcpy(mem_ptr, data, diff);
+    data = (char*)data + (long unsigned int)diff;
+    bytes_written = bytes_written + diff;
+    //TODO: this is my issue
+    for(int h = 0; h < N_DBLOCKS; h++) {
+      printf("data block %d\n", current_in.dblocks[h]);
+    }
+    char verify_buf[BLOCK_SIZE] = {0}; 
+    for (int i = (starting_block +1); i < N_DBLOCKS && bytes_written < end_bytes; i++) {
+      printf("still writing at block %d, data is %p, end of data is %p to data block %d\n", i, data, ((char*)data + size*num), current_in.dblocks[i]);
+      diff = BLOCK_SIZE;
+      if (diff > (end_bytes - bytes_written)) {
+        diff = end_bytes - bytes_written;
+      }
+      mem_ptr = mem_buffer + DATA_OFFSET+ current_in.dblocks[i]*BLOCK_SIZE;
+      memcpy(mem_ptr, data, diff);
+      
+      data = (char*)data + diff;
+      bytes_written = bytes_written + diff;
+
+      //this is to check my work
+      f_seek(vn, 0, (bytes_written - diff), SEEK_SET);           
+      size_t amount_read = f_read(vn, verify_buf, diff, 1, fd);
+      printf("just wrote: %ld %s \n", amount_read,verify_buf);
+    }
+
+    //move to the indirect blocks. We need to alloc each indirect table and data block as we go
+    if (bytes_written < end_bytes) {
+      write_to_indirect_blocks(0, bytes_written, end_bytes, current_in, data);
+    }
+  // we write starting in the indirect blocks. At least one indirect block has been alloced.
+  } else {
+    
+    //                          indirect bytes                        /  bytes stored per indirect table    
+    int indirect_table_idx = (open_file_pos - N_DBLOCKS*BLOCK_SIZE) / ((BLOCK_SIZE/4)*BLOCK_SIZE);
+    //                      indirect bytes                      % bytes stored per indirect table 
+    int offset_in_table = (open_file_pos - N_DBLOCKS*BLOCK_SIZE) % ((BLOCK_SIZE/4)*BLOCK_SIZE);
+    //if the table is not perfectly 
+    //all bytes alloced over indirect table / bytes alloced per block
+    int table_idx = (offset_in_table)/ BLOCK_SIZE;
+    int offset_in_data = offset_in_table%BLOCK_SIZE;
+    int indirect_table_block = current_in.iblocks[indirect_table_idx];
+    int data_block_idx;
+
+    //if there is a partially filled data block
+    if (offset_in_data != 0) {
+      int diff = BLOCK_SIZE -offset_in_data;
+      //in case we dont need to move to a new block and can fill existing block
+      if (diff > (end_bytes - bytes_written)) {
+        diff = end_bytes - bytes_written;
+      }
+
+      //get the top of the table block
+      char* mem_ptr = mem_buffer+DATA_OFFSET+ indirect_table_block*BLOCK_SIZE;
+      //get the address in the table
+      mem_ptr = mem_ptr + table_idx*4;
+
+      //get the address of the data block
+      memcpy((void*)&data_block_idx, mem_ptr, sizeof(int));
+      //go to the partially filled data block
+      mem_ptr = mem_buffer+ DATA_OFFSET+ data_block_idx*BLOCK_SIZE;
+
+      //fill the partially filled block last alloced from the last written to the end
+      memcpy(mem_ptr, data, diff);
+      bytes_written = bytes_written + diff;
+    } else {
+      table_idx = table_idx -1;
+    }
+    
+    //if at least some data has already been alloced in this indirect table (I don't need to alloc a block for the table)
+    if (table_idx != 0 && offset_in_data != 0) {
+      //fill the rest of the slots in the table - for each slot, alloc a new data block
+      for (int j = table_idx+1; j < (BLOCK_SIZE/4) &&  bytes_written < end_bytes; j++) {
+        int alloc_block = s_block.free_block;
+        //update the indirect table with the block
+        mem_ptr = mem_buffer+ DATA_OFFSET+ current_in.iblocks[indirect_table_idx]*BLOCK_SIZE;
+        mem_ptr = mem_ptr+ 4*j;
+        memcpy(mem_ptr, (void*)&alloc_block, sizeof(int));
+
+        //update super block with the next free block
+        mem_ptr = mem_buffer + DATA_OFFSET+alloc_block*BLOCK_SIZE;
+        //TODO: change this into just changing the sblock, and writing the s_block to memory
+        memcpy((void*)&s_block.free_block, mem_ptr, sizeof(int));
+        
+        //zero out the new block before you write to it
+        memset(mem_ptr, 0, BLOCK_SIZE);
+
+        //TODO: data ptr needs to be updated after each write
+        if (end_bytes - bytes_written < BLOCK_SIZE) {
+          memcpy(mem_ptr,data,(end_bytes - bytes_written));
+          bytes_written = bytes_written + (end_bytes - bytes_written);
+        } else {
+          memcpy(mem_ptr,data,BLOCK_SIZE);
+          bytes_written = bytes_written + BLOCK_SIZE;
+        }
+      }
+    } else {
+      //in the case that you start a new table block, you are allocating the current indirect block not just indirect_table_idx+1
+      indirect_table_idx = indirect_table_idx -1;
+    }
+    
+    //blocks get allocated for new tables pointing to new data
+    if (bytes_written < end_bytes) {
+      write_to_indirect_blocks(indirect_table_idx+1, bytes_written, end_bytes , current_in, data);
+    }
+  }
+
+
+  current_in.size = current_in.size + bytes_written;
+  
+  //write the inode to memory
+  mem_ptr = mem_buffer + INODE_OFFSET + vn->inode*BLOCK_SIZE;
+  memcpy(mem_ptr, (void*)&current_in, sizeof(inode));
+
+  //copy s_block , with the final updated free block, to the disk just in case free block changed NOTE: this design requires no simultaneous processes on the disk!!
+  mem_ptr = mem_buffer + BLOCK_SIZE;
+  memcpy(mem_ptr, (void*)&s_block, sizeof(superblock));
+  printf("wrote %d bytes\n",bytes_written);
+
+  return bytes_written;
+}
+
+int f_close(vnode_t *vn, vfd_t fd)
+{
+  if (vn->type == 0) {
+    fs_errno = EISDIR;
+    return -1;
+  } else if (vn != open_file) {
+    fs_errno = EBADF;
+    return -1;
+  }
+  open_file_pos = 0;
+  open_file = NULL;
+  return 0;
+}
+
+
+int f_seek(vnode_t *vn, vfd_t fd, off_t offset, int whence)
+{
+  inode current_in;
+
+  //get the inode
+  char* mem_ptr = mem_buffer + vn->inode*BLOCK_SIZE + INODE_OFFSET;
+  memcpy((void*)&current_in, (void*)mem_ptr, sizeof(inode));
+
+  if (vn != open_file) {
+    fs_errno = EBADF;
+    return -1;
+  }
+
+  int new_location = 0;
+  if (whence == SEEK_SET) {
+    //set the fd to the address (offset) from the start of the file
+    new_location = offset;
+  } else if (whence == SEEK_CUR) {
+    new_location = open_file_pos+whence;
+  } if (whence == SEEK_END) {
+    new_location = current_in.size + whence;
+  }
+  
+  open_file_pos = new_location;
+  return new_location;
+}
+
+
+int f_stat(vnode_t *vn, vfd_t fd, vstat_t* stats)
+{
+  //fill out vstats
+  inode current_in;
+  char* mem_ptr = mem_buffer + vn->inode*BLOCK_SIZE + INODE_OFFSET;
+  memcpy((void*)&current_in, (void*)&mem_ptr, sizeof(inode));
+
+  stats->st_type = vn->type;
+  stats->st_inode = vn->inode;
+  stats->st_perms = vn->permissions;
+  stats->st_size = current_in.size;
+
+  if (current_in.size <= N_DBLOCKS*BLOCK_SIZE) {
+    stats->st_blocks = N_DBLOCKS;
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 1*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 1 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 2*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 2 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 3*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 3 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else if (current_in.size <= (N_DBLOCKS*BLOCK_SIZE + 4*(BLOCK_SIZE/4)*BLOCK_SIZE)) {
+    stats->st_blocks = N_DBLOCKS + 4 + ((current_in.size - N_DBLOCKS*BLOCK_SIZE)/BLOCK_SIZE);
+  } else {
+    stats->st_blocks = -1;
+  }
+  
+  return -1;
+}
+
+//remove the vn from the inode of the parent dir
+int f_remove(vnode_t *vn, vfd_t fd)
+{
+  struct inode current_in;
+  struct vnode* parent_vn = vn->parent;
+
+  //get the inode
+  char* mem_ptr = mem_buffer + INODE_OFFSET + (vn->inode)*BLOCK_SIZE;
+  memcpy((void*)&current_in, mem_ptr, sizeof(inode));
+  printf("deleting inode %d of size %d\n", vn->inode, current_in.size);
+
+  //zero out the direct blocks of the file
+  for (int i = 0; i < N_DBLOCKS; i++) {
+    mem_ptr = mem_buffer + DATA_OFFSET + current_in.dblocks[i]*BLOCK_SIZE;
+    //memset(mem_ptr, 0, BLOCK_SIZE);
+  }
+
+  //free each block the indirect table points to, then free the indirect table block, then delete each data block and indirect block;
+  if (current_in.size > (N_DBLOCKS*BLOCK_SIZE)) {
+    
+    //the last indirect table alloced
+    int indirect_table_idx = (current_in.size - N_DBLOCKS*BLOCK_SIZE)/((BLOCK_SIZE/4)*BLOCK_SIZE);
+    int offset_in_table = (current_in.size - N_DBLOCKS*BLOCK_SIZE)%((BLOCK_SIZE/4)*BLOCK_SIZE);
+    //in the table, the last table entry alloced
+    int table_idx = (offset_in_table)/ BLOCK_SIZE;
+    
+    //only loop through the alloced blocks of indirect tables
+    for (int j = 0; j < (indirect_table_idx+1); j++) {
+      char* table_ptr = mem_buffer+DATA_OFFSET+(current_in.iblocks[j]*BLOCK_SIZE);
+      char* table_end = table_ptr + BLOCK_SIZE;
+      int block_to_free;
+      //for the last table, probably not every block was alloced in table
+      if (j == indirect_table_idx) {
+        table_end = table_ptr + sizeof(int)*table_idx;
+      }
+
+      while (table_ptr < table_end) {
+        //get the alloced block
+        memcpy((void*)&block_to_free, table_ptr, sizeof(int));
+
+        //find the alloced block in memory
+        mem_ptr = mem_buffer + DATA_OFFSET + block_to_free*BLOCK_SIZE;
+
+        //update the head of the freeblocks in superblock
+        int next_free = s_block.free_block;
+        s_block.free_block = block_to_free;
+
+        //write the address of the previous free block head to the freed block
+        memcpy(mem_ptr, (void*)&next_free, sizeof(int));
+
+        table_ptr = table_ptr + sizeof(4);
+      }
+    }
+  }
+  
+  //zero out the newly freed inode
+  //memset((void*)&current_in, 0, sizeof(inode));
+  
+  //get the current head of the free inode list
+  int next_free_in = s_block.free_inode;
+  //set the next free inode to the head of the inode list
+  current_in.next_inode = next_free_in;
+  //set the just freed inode to be the head of free inode list
+  s_block.free_inode = vn->inode;
+
+  //copy the freed inode to memory
+  mem_ptr = mem_buffer + INODE_OFFSET + (vn->inode)*BLOCK_SIZE;
+  memcpy(mem_ptr, (void*)&current_in, sizeof(inode));
+  
+  //write the sblock to memory with updated free inode head and updated free data block head
+  mem_ptr = mem_buffer + BLOCK_SIZE;
+  memcpy(mem_ptr, (void*)&s_block, sizeof(superblock));
+  
+  //Free the vnode, so change the parent not to point to the child
+  if (parent_vn != NULL) {
+    int i = 0;
+    
+    while(i < parent_vn->num_children &&parent_vn->child_ptrs[i] != vn ) {
+      i++;
+    }
+    
+    while (i < (parent_vn->num_children-1)) {
+      parent_vn->child_ptrs[i] = parent_vn->child_ptrs[i+1];
+      i++;
+    }
+    parent_vn->num_children = parent_vn->num_children -1;
+  }
+
+  //set the vdir entry to invalid
+  printf("not big enough for indirect blocks\n");
+  free(vn);
+
+  return 0;
+}
+
+//Given a directory path, return the directory inode.
+//TODO:Revise to move along path
+vfd_t f_opendir(vnode_t *vn, const char* path)
+{
+  if (vn->type != 0) {
+    fs_errno = ENOTDIR;
+    return -1;
+  }
+  open_dir = vn;
+  return vn->inode;
+}
+
+//TODO:make sure every table entry gets freed
+//readdir looks at the physical data tables in one block
+//TODO: check that we are in the open directory
+
+//given the entry number in the directory to read, readdir returns the table entry at that memory address
+vdir_entry* f_readdir(vnode_t *vn, vfd_t fd)
+{
+  printf("look through %s\n", vn->name);
+  struct vdir_entry *table_entry = (vdir_entry*)malloc(sizeof(vdir_entry));
+  char entry_buffer[sizeof(vdir_entry)];
+  off_t offset = ((off_t)fd)*sizeof(vdir_entry);//offset in data to read entry from
+
+  f_seek(vn, 0, offset, SEEK_SET);
+  //read in the vdir entry
+  int size = f_read(vn, entry_buffer, sizeof(vdir_entry),1, 0);
+  
+  if (size != sizeof(vdir_entry)) {
+    printf("Error reading directory");
+    return NULL;
+  }
+
+  //if it was copied correctly, return the entry
+  memcpy((void*)table_entry, entry_buffer, sizeof(entry_buffer));
+
+  return table_entry;
+}
+
+
+//TODO: add error criteria EBADF fd is not a valid file descriptor or is not open for readin
+int f_closedir(vnode_t *vn, int fd)
+{
+  
+  if (vn == NULL || vn->parent == NULL) {
+    fs_errno = EINVAL;
+    return -1;
+  }
+  if (vn->parent->type != 0) {
+    fs_errno = ENOTDIR;
+    return -1;
+  }
+  open_dir = vn->parent;
+  return 0;
+}
+
+
+int f_mkdir(vnode_t *vn, const char* name)
+{
+  //make a given directory under the vnode
+  char* mem_ptr;
+  vnode *new_vn = (vnode*)(malloc(sizeof(vnode)));
+  new_vn->type = 0;
+  memset(&new_vn->name, 0, sizeof(new_vn->name));
+  strncpy(new_vn->name, name, sizeof(new_vn->name));
+  new_vn->num_children = 0;
+  //TODO:review
+  new_vn->permissions = (O_CREAT | O_WRONLY);
+  new_vn->parent = vn;
+  new_vn->vnode_number = next_vnode;
+  next_vnode++;
+  new_vn->inode = s_block.free_inode;
+  //move sblock inode up 1 on the list
+  inode new_in;
+  int next_free_in;
+  mem_ptr = mem_buffer + INODE_OFFSET + s_block.free_inode*BLOCK_SIZE;
+  memcpy((void*)&new_in, mem_ptr, sizeof(inode));
+  next_free_in = new_in.next_inode;
+  s_block.free_inode = next_free_in;
+  mem_ptr = mem_buffer + BLOCK_SIZE;
+  memcpy(mem_ptr, (void*)&s_block, sizeof(superblock));
+
+
+  vn->child_ptrs[vn->num_children] = new_vn;
+  vn->num_children = vn->num_children+1;
+
+  return -1;
+}
+
+/*find the children of the dir and remove them as well*/
+int delete_vnode_tree(vnode* parent_vn, vnode* current_vn) {
+  printf("delete %d\n", current_vn->inode);
+    
+  //the inode is a file, set the inode to be free and return
+  if (current_vn->type == 1) {
+    //TODO: 0 is a placeholder
+    f_remove(current_vn, 0);
+    return 0;
+  }
+
+  //the inode is a dir inode, recurse
+  for (int i = 0; i < current_vn->num_children; i++) {
+    vnode* child_vn = current_vn->child_ptrs[i];
+    delete_vnode_tree(current_vn, child_vn);
+  }
+
+  //TODO: 0 is a placeholder
+  printf("ready to remove parent dir\n");
+  f_remove(current_vn, 0);
+;  return 0;
+}
+ 
+//REVIEW: is it ok to disregard the path?
+int f_rmdir(vnode_t *vn, const char* path)
+{
+  //struct vnode* to_remove = root_vnode;
+  
+  delete_vnode_tree(vn->parent, vn);
+  return -1;
+}
+
+//recursive logic to build the tree
+int build_vnode_tree(vnode* parent_vn, vnode* child_vn, int child_in_idx) {
+  struct vdir_entry *table_entry;
+  struct vnode* current_vn = child_vn;
+  struct inode current_in;
+
+  //get the inode;
+  char* mem_ptr = (mem_buffer + INODE_OFFSET) + (child_in_idx * BLOCK_SIZE);
+  printf("build tree %d in mem buffer %p at address %p\n", next_vnode, mem_buffer, mem_ptr);
+  memcpy((void*)&current_in, mem_ptr, sizeof(inode));
+
+  for(int h = 0; h < N_DBLOCKS; h++) {
+    printf("data block %d\n", current_in.dblocks[h]);
+  }
+  
+  //initialize the new vnode
+  current_vn->parent = parent_vn; 
+  memset(&current_vn->name, 0, sizeof(current_vn->name));
+  strcpy(current_vn->name, current_in.name);
+  current_vn->permissions = current_in.permissions;
+  current_vn->vnode_number = next_vnode;
+  next_vnode++;
+  current_vn->inode = child_in_idx;
+  
+  //the inode is a file, return
+  //TODO: in fcreate, set the children of files to -1;
+  if (current_in.type == 1) {
+    current_vn->type = 1;
+    current_vn->num_children = -1;
+    return 0;
+  }
+
+  //the inode is a dir inode,recurse
+  current_vn->type = 0;
+  current_vn->num_children = (current_in.size)/(sizeof(vdir_entry));
+
+  //zero out the child pointers
+  //memset(&current_vn->child_ptrs, 0, sizeof(current_vn->child_ptrs));
+  printf("dir has %d size %d children\n",current_in.size, current_vn->num_children);
+
+  int children_read = 0;
+  int idx = 0;
+  while (children_read < current_vn->num_children) {
+    table_entry = f_readdir(current_vn, idx);
+    if (table_entry != NULL && table_entry->valid == 1) {
+      
+      vnode* new_child_vn = (vnode*)malloc(sizeof(vnode));
+      //set the current 
+      current_vn->child_ptrs[idx] = new_child_vn;
+      build_vnode_tree(current_vn, new_child_vn, table_entry->inode_idx);
+      children_read++;
+    }
+    free(table_entry);
+    idx++;
+  }
+
+  return 0;
+}
+
+/*initialize the mem_buffer*/
+//REVIEW: decide if init_fs should call fmount on disk
+int init_fs() {
+  
+  memset(mem_buffer, 0, sizeof(1000000));
+  memset(buffer_block, 0, BLOCK_SIZE);
+  
+  FILE *disk= fopen("file_sys.bin", "rb");
+
+  if (disk == NULL) {
+      printf("DISK file not found. File system not loaded.\n Please format file system by issuing \"./format\" command\n");
+  } else {
+    fread(mem_buffer, 1000000 - 1,1, disk);
+      //f_mount();
+  }
+  fclose(disk);
+
+  //move beyond boot block to superblock
+  char* mem_ptr = mem_buffer+BLOCK_SIZE;
+  memcpy((void*)&s_block, mem_ptr, sizeof(superblock));
+  
+  return 1;
+}
+ 
+//F_mount opens the root directory, creates the vnode tree
+int f_mount(vnode_t *vn, const char* sourcefile, const char* path) {
+  struct vnode *current_vn = vn;
+  struct inode current_in;
+  //memset((void*)&current_in, 0, sizeof(inode));
+
+  //not mounting onto existing file system
+  if (root_vnode == NULL) {
+    //get root inode
+    char* mem_ptr = mem_buffer+INODE_OFFSET;
+    memcpy((void*)&current_in, mem_ptr, sizeof(inode));
+
+    //deal with making the root vnode. if the root vnode is null, initialize vnode tree root
+    if (current_in.type == 0) {
+      root_vnode = current_vn;
+      open_dir = root_vnode;
+      printf("root dir name is %s inode at %p in table %p inode offset %d\n",current_in.name, mem_ptr, mem_buffer, INODE_OFFSET);
+
+      build_vnode_tree(NULL, current_vn, 0);
+      printf("end\n");
+    } else {
+      fs_errno = ENOTDIR;
+      return -1;
+    }
+  }
+
+  if (root_vnode != NULL && vn == NULL) {
+    fs_errno = EINVAL;
+    return -1;
+  }
+
+  //TODO: Deal with case of mounting onto fs
+  return 0;
+}
+ 
+int f_unmount(vnode_t *vn, const char* path)
+{
+  /*free the vnode tree*/
+  f_rmdir(root_vnode, path);
+  return 0;
+}
+
+int save_fs(const char* filename) {
+    FILE *fp = fopen(filename, "wb");
+
+    fwrite(mem_buffer, 1000000, 1,  fp);
+   
+    fclose(fp);
+    return 0;
+}
+
+
+int move(vnode* vn, vnode* new_parent) {
+  return -1;
+}

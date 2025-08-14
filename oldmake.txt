@@ -1,0 +1,19 @@
+CC=g++
+INCLUDES=-I. -I..
+LIBS=-L.
+SOURCES=$(wildcard test/*.c)
+SOURCES+=format.c
+FILES := $(subst .c,,$(SOURCES))
+
+# By default, make runs the first target in the file
+all: libvfs.so $(FILES) 
+
+libvfs.so: vfs.c
+	$(CC) -g -Wall -Wvla -Werror $(INCLUDES) -fPIC -c $< -o vfs.o 
+	$(CC) -shared -o $@ vfs.o 
+
+% :: %.c libvfs.so
+	$(CC) -g -Wall -Wvla -Werror $(INCLUDES) $(LIBS) -Wl,-rpath=. $< -o $@ -lvfs -lm
+
+clean: 
+	rm -f $(FILES) libvfs.so
